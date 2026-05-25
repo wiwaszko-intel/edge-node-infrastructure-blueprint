@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 name: create-image
-description: Build a host OS image using the ICT (Image Composer Tool) from a source template with customizable user credentials and secure boot options.
+description: Build a host OS image using the ICT (Image Composer Tool) from a source template with customizable user credentials.
 ---
 
 ## Trigger Phrases
@@ -16,7 +16,6 @@ description: Build a host OS image using the ICT (Image Composer Tool) from a so
 - enib_home: absolute path to this repository root (default: current workspace root)
 - work_template: output template path to edit (default: `<target_template>` basename prefixed with `work-`)
 - target_template: source template path (default: `infrastructure/host-os/ict/ubuntu24-x86_64-minimal-ptl.yml`)
-- secure_boot: `true|false` (default: `false`; ask only when unclear)
 - os_image_composer_repo: clone path for image-composer-tool (default: `<enib_home>/tools/image-composer-tool`)
 
 ## Preconditions
@@ -46,8 +45,7 @@ Prompt only before destructive operations:
    - `./workspace/ubuntu-ubuntu24-x86_64/imagebuild/<config-name>/`
 
 **Prompt only once for missing required inputs:**
-6. Apply template edits with minimal prompts:
-   - ask for secure boot key paths only when `secure_boot=true`
+6. Apply template edits with minimal prompts.
 
 **Prompt only once before destructive action:**
 7. Ask for explicit confirmation before privileged build.

@@ -20,10 +20,9 @@ and the provided template
 3. [Install the Tool](#install-the-tool)
 4. [Install Image Composition Prerequisites](#install-image-composition-prerequisites)
 5. [Configure the Template](#configure-the-template)
-6. [(Optional) Generate Secure Boot Keys](#optional-generate-secure-boot-keys)
-7. [Validate the Template](#validate-the-template)
-8. [Build the Image](#build-the-image)
-9. [Build Output](#build-output)
+6. [Validate the Template](#validate-the-template)
+7. [Build the Image](#build-the-image)
+8. [Build Output](#build-output)
 
 ---
 
@@ -33,7 +32,6 @@ and the provided template
 |-------------|----------------|
 | Build host OS | Ubuntu 24.04 (recommended) |
 | Go toolchain | 1.24.0 or later — [installation guide](https://go.dev/doc/manage-install) |
-| OpenSSL | Required only if generating Secure Boot keys |
 
 ---
 
@@ -95,52 +93,6 @@ users:
   - name: user
     password: "<SHA-512-hashed-password>"
 ```
-
----
-
-## (Optional) Generate Secure Boot Keys
-
-If you want Secure Boot enforcement in the image, generate the required
-keys **before** building. Skip this section if Secure Boot is not required.
-
-```bash
-# Create a directory for Secure Boot keys
-mkdir -p /data/secureboot/keys
-cd /data/secureboot/keys
-
-# Generate RSA 3072-bit private key and self-signed certificate (SHA-384)
-openssl req -new -x509 -newkey rsa:3072 -sha384 \
-  -keyout DB.key -out DB.crt \
-  -days 3650 -nodes \
-  -subj "/CN=ICT Secure Boot Key/"
-
-# Convert certificate to DER format (required by UEFI)
-openssl x509 -outform DER -in DB.crt -out DB.cer
-```
-
-> **Key strength note:** `RSA3072SHA384` is recommended. Validate your
-> firmware supports it before using `RSA2048SHA256`.
-
-Generated files:
-
-| File | Purpose |
-|------|---------|
-| `DB.key` | Private signing key — keep secure, never commit |
-| `DB.crt` | Certificate in PEM format |
-| `DB.cer` | Certificate in DER format (for UEFI enrollment) |
-
-Then add the following section to your template (use absolute paths):
-
-```yaml
-immutability:
-  enabled: true
-  secureBootDBKey: "/data/secureboot/keys/DB.key"
-  secureBootDBCrt: "/data/secureboot/keys/DB.crt"
-  secureBootDBCer: "/data/secureboot/keys/DB.cer"
-```
-
-> **Note:** The template ships with `immutability.enabled: false`. Set it
-> to `true` only when adding Secure Boot keys as shown above.
 
 ---
 
@@ -221,7 +173,6 @@ Expected artefacts:
 | File | Description |
 |------|-------------|
 | `minimal-desktop-ubuntu.raw.gz` | Compressed raw disk image (ready to flash) |
-| `DB.cer` | Secure Boot certificate, if keys were configured |
 
 To flash the image to a target device (confirm device path before running):
 
