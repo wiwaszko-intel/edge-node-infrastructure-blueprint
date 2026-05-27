@@ -388,227 +388,284 @@ EOT
 }
 # Attended MODE - Custom partition setup with dialog
 create_partitions() {
-    echo -e "${BLUE}Custom Partition Setup${NC}"
-    
-    TTY=/dev/tty1
 
-    local tmpfile disk_total_mb last_end_mb free_mb free_gb current_layout partition_num used_mb
+    echo -e "${BLUE}Custom Partition Setup${NC}"
+    TTY=/dev/tty1
+    local tmpfile disk_total_mb rootfs_size_mb existing_partitions_mb free_mb free_gb rootfs_size_gb remaining_mb remaining_gb current_layout partition_num
     
     tmpfile=$(mktemp /tmp/dialog.XXXXXX)
-    partition_num=3
-    used_mb=0
-
-    #  Ask if user wants custom partitions
-    dialog --title "Partition Setup" --yesno "Do you want to create custom partitions?\n\n(Select 'No' to use default layout)" 0 0 <$TTY >$TTY 2>/dev/null
+    CUSTOM_PARTITIONS=""
+    partition_num=1
+    
+    # Ask if user wants to create custom partitions or use default layout
+    dialog --title "Partition Setup" \
+        --yesno "Do you want to create custom partitions?\n\n(Select 'No' to use default layout)" \
+        0 0 <$TTY >$TTY 2>/dev/null
     if [ $? -ne 0 ]; then
         log "Using default partition layout."
         rm -f "$tmpfile"
         return 0
     fi
-
-    # Calculate disk space 
-    disk_total_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print | grep "^Disk" | awk '{print $3}' | tr -d 'MB')
-    last_end_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print | awk '/^ [0-9]/ {print $3}' | tr -d 'MB' | sort -n | tail -1)
-    last_end_mb=${last_end_mb:-1}
-    free_mb=$((disk_total_mb - last_end_mb))
+    
+    ROOTFS_PARTITION="${os_disk}${os_rootfs_part}"
+    ROOTFS_PART_NUM=$(echo "$os_rootfs_part" | tr -dc '0-9')
+    
+    # Get total disk size
+    disk_total_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null | grep "^Disk" | cut -d: -f2 | tr -d 'MB ')
+    # Get current rootfs partition size
+    rootfs_size_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null \
+        | awk -v p="$ROOTFS_PART_NUM" '
+            $1 == p {
+                val=$4
+                sub("MB","",val)
+                split(val,a,".")
+                print a[1]
+            }')
+   
+    # Get the default partition sizes of existing partitions to calculate free space
+    existing_partitions_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null \
+        | awk '
+            $1 ~ /^[0-9]+$/ {
+                val=$4
+                sub("MB","",val)
+                split(val,a,".")
+                total+=a[1]
+            }
+            END {
+                print total+0
+            }')
+    [ -z "$disk_total_mb" ] && disk_total_mb=0
+    [ -z "$rootfs_size_mb" ] && rootfs_size_mb=0
+    [ -z "$existing_partitions_mb" ] && existing_partitions_mb=0
+   
+    # Get free space available for partitioning
+    free_mb=$((disk_total_mb - existing_partitions_mb))
+    if [ "$free_mb" -lt 0 ]; then
+        free_mb=0
+    fi
     free_gb=$((free_mb / 1024))
-    # Use uppercase for loop references
+    rootfs_size_gb=$((rootfs_size_mb / 1024))
     FREE_MB=$free_mb
     FREE_GB=$free_gb
-    USED_MB=$used_mb
-    PARTITION_NUM=$partition_num
+    
     current_layout=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null)
+    dialog \
+        --title "Current Disk Layout — $USER_SELECTED_DISK" \
+        --msgbox "$current_layout
 
-    dialog --title "Current Disk Layout — $USER_SELECTED_DISK" --msgbox "$current_layout\n\n─────────────────────────────────\nFree space available : ${free_gb}GB (${free_mb}MB)\n\nNew partitions will be added AFTER existing ones.\nExisting partitions will NOT be modified." 0 0 <$TTY >$TTY 2>/dev/null
+─────────────────────────────────
+Disk Size            : $((disk_total_mb / 1024))GB
+Existing Partitions  : $((existing_partitions_mb / 1024))GB
+Available Free Space : ${free_gb}GB
 
-    # Ask to resize rootfs first
+Current Rootfs Size  : ${rootfs_size_gb}GB
+
+Rootfs Needs to be resized first to accommodate additional space." \
+        0 0 <$TTY >$TTY 2>/dev/null
     while true; do
         dialog \
-            --title "Resize Rootfs (Optional)" \
-            --inputbox "Enter rootfs size in GB For expansion before adding new partitions:\n(Press Enter to skip, if skipped no additional size will be allocated for future use)\n\nCurrent free space: ${free_gb}GB" \
+            --title "Resize Rootfs" \
+            --inputbox "Current rootfs size : ${rootfs_size_gb}GB
+
+Enter ADDITIONAL size in GB.
+
+Example:
+Current : 40
+Input   : 20
+Final   : 60
+
+Available free space : ${free_gb}GB" \
             0 0 \
             <$TTY >$TTY 2>"$tmpfile"
-
-        if [ $? -ne 0 ]; then break; fi
-
-        ROOTFS_SIZE_GB=$(cat "$tmpfile")
-
-        # If empty, skip resize
-        if [ -z "$ROOTFS_SIZE_GB" ]; then
-            break
+        if [ $? -ne 0 ]; then
+            rm -f "$tmpfile"
+            return 1
         fi
-
-        # Validate number
-        if ! echo "$ROOTFS_SIZE_GB" | grep -qE '^[0-9]+$' || [ "$ROOTFS_SIZE_GB" -le 0 ]; then
+        ROOTFS_ADDITIONAL_GB=$(cat "$tmpfile")
+        if ! echo "$ROOTFS_ADDITIONAL_GB" | grep '^[0-9][0-9]*$' >/dev/null; then
             dialog --title "Error" \
-                --msgbox "Invalid size! Enter a positive number in GB." \
+                --msgbox "Enter valid numeric size." \
                 0 0 <$TTY >$TTY 2>/dev/null
             continue
         fi
-
-        # Convert to MB for more accurate validation
-        ROOTFS_SIZE_MB=$((ROOTFS_SIZE_GB * 1024))
-
-        if [ "$ROOTFS_SIZE_MB" -gt "$free_mb" ]; then
+        ROOTFS_ADDITIONAL_MB=$((ROOTFS_ADDITIONAL_GB * 1024))
+        if [ "$ROOTFS_ADDITIONAL_MB" -gt "$free_mb" ]; then
             dialog --title "Error" \
-                --msgbox "Size ${ROOTFS_SIZE_GB}GB exceeds available space ${free_gb}GB!" \
+                --msgbox "Requested size exceeds available free space." \
                 0 0 <$TTY >$TTY 2>/dev/null
             continue
         fi
+        ROOTFS_FINAL_MB=$((rootfs_size_mb + ROOTFS_ADDITIONAL_MB))
+        ROOTFS_FINAL_GB=$((ROOTFS_FINAL_MB / 1024))
+        dialog \
+            --title "Confirm Rootfs Resize" \
+            --yesno "Resize rootfs from
 
-        dialog --title "Confirm Rootfs Resize" \
-            --yesno "Resize rootfs to ${ROOTFS_SIZE_GB}GB?" \
+        ${rootfs_size_gb}GB → ${ROOTFS_FINAL_GB}GB ?" \
             0 0 <$TTY >$TTY 2>/dev/null
-
         if [ $? -eq 0 ]; then
-            CUSTOM_PARTITIONS="/ $ROOTFS_SIZE_MB ext4"
-            USED_MB=$ROOTFS_SIZE_MB
-            FREE_MB=$free_mb
+            CUSTOM_PARTITIONS="/ $ROOTFS_FINAL_MB ext4"
+            FREE_MB=$((FREE_MB - ROOTFS_ADDITIONAL_MB))
             break
         fi
     done
-
-    # Create custom partitions
+    
     while true; do
-
-        # Ask partition type 
+        remaining_mb=$FREE_MB
+        remaining_gb=$((remaining_mb / 1024))
+        if [ "$remaining_mb" -le 0 ]; then
+            dialog --title "Partition Setup" \
+                --msgbox "No remaining free space available." \
+                0 0 <$TTY >$TTY 2>/dev/null
+            break
+        fi
+        
+        # Partition type
         dialog \
-            --title "Partition Type — Slot $PARTITION_NUM" \
-            --menu "Choose partition type:" \
+            --title "Custom Partition Type — Slot $partition_num" \
+            --menu "Choose partition type you want to create:" \
             0 0 0 \
-            data "Data partition (needs mount point)" \
-            swap "Swap partition  (no mount point)" \
+            data "Data partition" \
+            swap "Swap partition" \
             2>"$tmpfile" <$TTY >$TTY
-
-        if [ $? -ne 0 ]; then break; fi
+        if [ $? -ne 0 ]; then
+            break
+        fi
         PART_TYPE=$(cat "$tmpfile")
-
-        # ── Mount point (skip for swap) ──
         if [ "$PART_TYPE" = "swap" ]; then
             MOUNTPOINT="swap"
         else
             while true; do
                 dialog \
-                    --title "Partition $PARTITION_NUM — Mount Point" \
-                    --inputbox "Enter mount point for new partition:\n(e.g. /home /data /data_persistent )\n\nLeave empty and press OK to finish." \
+                    --title "Partition $partition_num — Mount Point" \
+                    --inputbox "Enter mount point
+Examples:
+/home
+/data
+/var
+
+Leave empty to finish." \
                     0 0 \
                     <$TTY >$TTY 2>"$tmpfile"
-
-                if [ $? -ne 0 ]; then break 2; fi
-
+                if [ $? -ne 0 ]; then
+                    break 2
+                fi
                 MOUNTPOINT=$(cat "$tmpfile")
-
-                # Empty = done
-                if [ -z "$MOUNTPOINT" ]; then break 2; fi
-
-                # Validate
-                if ! echo "$MOUNTPOINT" | grep -qE '^/[a-zA-Z0-9/_-]*$'; then
+                [ -z "$MOUNTPOINT" ] && break 2
+                if ! echo "$MOUNTPOINT" \
+                    | grep '^/[a-zA-Z0-9/_-]*$' >/dev/null; then
                     dialog --title "Error" \
-                        --msgbox "Invalid mount point!\nMust start with /\nOnly letters, numbers, _ - / allowed." \
+                        --msgbox "Invalid mount point." \
                         0 0 <$TTY >$TTY 2>/dev/null
                     continue
                 fi
-
                 # Duplicate check
-                if echo "$CUSTOM_PARTITIONS" | grep -q "^$MOUNTPOINT "; then
+                if echo "$CUSTOM_PARTITIONS" \
+                    | awk '{print $1}' \
+                    | grep -x "$MOUNTPOINT" >/dev/null; then
                     dialog --title "Error" \
-                        --msgbox "Mount point '$MOUNTPOINT' already added!" \
+                        --msgbox "Mount point already exists." \
                         0 0 <$TTY >$TTY 2>/dev/null
                     continue
                 fi
-
                 break
             done
         fi
-
-        # Size in GB 
+       
+        # Partition size
         while true; do
-            REMAINING_MB=$((FREE_MB - USED_MB))
-            REMAINING_GB=$((REMAINING_MB / 1024))
+            remaining_mb=$FREE_MB
+            remaining_gb=$((remaining_mb / 1024))
             dialog \
-                --title "Partition $PARTITION_NUM — Size" \
-                --inputbox "Enter size in GB:\n(e.g. 1 = 1GB | 10 = 10GB)\n\nDisk free      : ${FREE_GB}GB\nAlready planned: $((USED_MB / 1024))GB\nRemaining      : ${REMAINING_GB}GB" \
+                --title "Partition $partition_num — Size" \
+                --inputbox "Enter partition size in GB
+
+Remaining free space : ${remaining_gb}GB" \
                 0 0 \
-                2>"$tmpfile" <$TTY >$TTY
-
-            if [ $? -ne 0 ]; then break 2; fi
-
+                <$TTY >$TTY 2>"$tmpfile"
+            if [ $? -ne 0 ]; then
+                break 2
+            fi
             PART_SIZE_GB=$(cat "$tmpfile")
-
-            # Validate number
-            if ! echo "$PART_SIZE_GB" | grep -qE '^[0-9]+$' || [ "$PART_SIZE_GB" -le 0 ]; then
+            if ! echo "$PART_SIZE_GB" \
+                | grep '^[0-9][0-9]*$' >/dev/null; then
                 dialog --title "Error" \
-                    --msgbox "Invalid size! Enter a positive number in GB." \
+                    --msgbox "Invalid numeric size." \
                     0 0 <$TTY >$TTY 2>/dev/null
                 continue
             fi
-
-            # Convert to MB for internal calculations
+            if [ "$PART_SIZE_GB" -le 0 ]; then
+                dialog --title "Error" \
+                    --msgbox "Size must be greater than 0." \
+                    0 0 <$TTY >$TTY 2>/dev/null
+                continue
+            fi
             PART_SIZE_MB=$((PART_SIZE_GB * 1024))
-
-            # Check fits in free space
-            if [ "$PART_SIZE_MB" -gt "$REMAINING_MB" ]; then
+            if [ "$PART_SIZE_MB" -gt "$remaining_mb" ]; then
                 dialog --title "Error" \
-                    --msgbox "Size ${PART_SIZE_GB}GB exceeds remaining space ${REMAINING_GB}GB!" \
+                    --msgbox "Partition exceeds remaining free space." \
                     0 0 <$TTY >$TTY 2>/dev/null
                 continue
             fi
-
             break
         done
-
-        # Filesystem (skip for swap)
+       
         if [ "$PART_TYPE" = "swap" ]; then
             FSTYPE="swap"
         else
             dialog \
-                --title "Partition $PARTITION_NUM — Filesystem" \
-                --menu "Choose filesystem type:" \
+                --title "Partition $partition_num — Filesystem" \
+                --menu "Choose filesystem:" \
                 0 0 0 \
-                ext4  "ext4  — Standard Linux (recommended)" \
-                xfs   "xfs   — High performance" \
-                btrfs "btrfs — Modern with snapshots" \
-                vfat  "vfat  — FAT32 (use for /boot/efi)" \
+                ext4  "Standard Linux filesystem" \
+                xfs   "High performance filesystem" \
+                btrfs "Snapshot capable filesystem" \
+                vfat  "FAT32 filesystem" \
                 <$TTY >$TTY 2>"$tmpfile"
-
-            if [ $? -ne 0 ]; then break 2; fi
+            if [ $? -ne 0 ]; then
+                break 2
+            fi
             FSTYPE=$(cat "$tmpfile")
         fi
-
-        # Confirm this partition
         if [ "$PART_TYPE" = "swap" ]; then
-            CONFIRM_MSG="Add this partition?\n\n  Type : Swap\n  Size : ${PART_SIZE_GB}GB\n  Note : No mount point needed"
-        else
-            CONFIRM_MSG="Add this partition?\n\n  Mount point : $MOUNTPOINT\n  Size        : ${PART_SIZE_GB}GB\n  Filesystem  : $FSTYPE"
-        fi
+            CONFIRM_MSG="Add swap partition?
 
-        dialog --title "Confirm Partition $PARTITION_NUM" \
+Size : ${PART_SIZE_GB}GB"
+        else
+            CONFIRM_MSG="Add partition?
+
+Mount Point : $MOUNTPOINT
+Size        : ${PART_SIZE_GB}GB
+Filesystem  : $FSTYPE"
+        fi
+        dialog \
+            --title "Confirm Partition $partition_num" \
             --yesno "$CONFIRM_MSG" \
             0 0 <$TTY >$TTY 2>/dev/null
-
-        if [ $? -ne 0 ]; then continue; fi
-
-        # Save entry (store in MB internally)
+        if [ $? -ne 0 ]; then
+            continue
+        fi
         CUSTOM_PARTITIONS="$CUSTOM_PARTITIONS
-        $MOUNTPOINT $PART_SIZE_MB $FSTYPE"
+$MOUNTPOINT $PART_SIZE_MB $FSTYPE"
+        FREE_MB=$((FREE_MB - PART_SIZE_MB))
+        partition_num=$((partition_num + 1))
+        remaining_mb=$FREE_MB
+        remaining_gb=$((remaining_mb / 1024))
+        dialog \
+            --title "Partition Setup" \
+            --yesno "Partition added.
 
-        USED_MB=$((USED_MB + PART_SIZE_MB))
-        PARTITION_NUM=$((PARTITION_NUM + 1))
+Remaining free space : ${remaining_gb}GB
 
-        # Ask to add another partition
-        REMAINING_MB=$((FREE_MB - USED_MB))
-        REMAINING_GB=$((REMAINING_MB / 1024))
-        dialog --title "Partition Setup" \
-            --yesno "Partition added!\n\nAllocated: $((USED_MB / 1024))GB | Remaining: ${REMAINING_GB}GB\n\nAdd another partition?" \
+Add another partition?" \
             0 0 <$TTY >$TTY 2>/dev/null
-
-        if [ $? -eq 0 ]; then continue; else break; fi
-
+        if [ $? -ne 0 ]; then
+            break
+        fi
     done
-
-    # Partition table final summary
+    
+    # Show summary of partitions to be created and confirm before applying
     if [ -n "$CUSTOM_PARTITIONS" ]; then
-
         SUMMARY=""
         while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -616,8 +673,9 @@ create_partitions() {
             SZ=$(echo "$line" | awk '{print $2}')
             FS=$(echo "$line" | awk '{print $3}')
             SZ_GB=$((SZ / 1024))
-
-            if [ "$FS" = "swap" ]; then
+            if [ "$MP" = "/" ]; then
+                SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' 'rootfs' "$SZ_GB" "$FS")\n"
+            elif [ "$FS" = "swap" ]; then
                 SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' '[swap]' "$SZ_GB" 'swap')\n"
             else
                 SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' "$MP" "$SZ_GB" "$FS")\n"
@@ -625,37 +683,38 @@ create_partitions() {
         done <<EOF
 $CUSTOM_PARTITIONS
 EOF
-
         dialog \
             --title "Final Partition Layout — $USER_SELECTED_DISK" \
-            --yesno "Review partitions to be added:\n\n$SUMMARY\n\nProceed?" \
+            --yesno "Review partition layout:
+
+$SUMMARY
+
+Proceed with partitioning?" \
             0 0 <$TTY >$TTY 2>/dev/null
-
         if [ $? -ne 0 ]; then
-            dialog --title "Partition Setup" \
-                --yesno "Do you want to start partition setup over?" \
+            dialog \
+                --title "Partition Setup" \
+                --yesno "Do you want to restart partition setup?" \
                 0 0 <$TTY >$TTY 2>/dev/null
-
             if [ $? -eq 0 ]; then
-                rm -f "$TMPFILE"
+                rm -f "$tmpfile"
                 CUSTOM_PARTITIONS=""
                 create_partitions
                 return $?
             else
                 CUSTOM_PARTITIONS=""
-                rm -f "$TMPFILE"
+                rm -f "$tmpfile"
                 return 0
             fi
         fi
-
-        # ── Apply partitions ──
-        apply_partitions || { rm -f "$TMPFILE"; return 1; }
+        apply_partitions || {
+            rm -f "$tmpfile"
+            return 1
+        }
     fi
-
-    rm -f "$TMPFILE"
+    rm -f "$tmpfile"
     return 0
 }
-
 
 apply_partitions() {
     echo -e "${BLUE}Applying custom partitions on $USER_SELECTED_DISK${NC}"
