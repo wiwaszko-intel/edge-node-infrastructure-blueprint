@@ -17,8 +17,9 @@ This context applies to the `infrastructure/` tree.
 | micro-os | Minimal OS image build and packaging flow | `make -C micro-os`, `bash micro-os/build.sh` |
 
 ## Available Skills
-Skills are defined under `.claude/skills/`.
-- `create-image`: Build Ubuntu 24.04 host images via ICT and validate resulting artifacts.
+Skills are defined under `skills/`.
+- `create-image`: Build host images via ICT and validate resulting artifacts.
+- `create-usb-installation-files`: Package bootable USB installation artifacts (HookOS, host image, deployment scripts) from an ICT image, Ubuntu ISO, or previously built image.
 - `validate-platform-config`: Validate a provisioned node over SSH for k3s health, cloud-init status, network/proxy setup, and hardware inventory.
 
 ## Constraints

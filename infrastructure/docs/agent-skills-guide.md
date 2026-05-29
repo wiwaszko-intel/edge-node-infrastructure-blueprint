@@ -47,7 +47,7 @@ Prompting is not enough for repeatability. Context engineering defines the persi
 | AGENTS.md | Per-directory | Universal context and constraints |
 | CLAUDE.md | Hierarchical, Claude-specific | Skill discovery and Claude behavior |
 | .github/copilot-instructions.md | Repo-wide | Copilot-specific coding and review conventions |
-| .claude/skills/<skill-id>/SKILL.md | Per skill | Executable workflow contract |
+| skills/<skill-id>/SKILL.md | Per skill | Executable workflow contract |
 
 Recommended baseline: use AGENTS.md everywhere, then add tool-specific files where needed.
 
@@ -68,12 +68,10 @@ ENIB/
     AGENTS.md
   benchmarks/
     AGENTS.md
-  .claude/
-    skills/
-      create-image/
-      deploy-plugins/
-      deploy-apps/
-      run-benchmark/
+  skills/
+    create-image/
+    create-usb-installation-files/
+    validate-platform-config/
 ```
 
 ### 2.2 Repository Files Used in This Workspace
@@ -84,14 +82,14 @@ Use the current repository files directly rather than maintaining separate templ
 - Claude behavior and skill contract: [CLAUDE.md](../../CLAUDE.md)
 - Infrastructure-scoped context: [infrastructure/AGENTS.md](../AGENTS.md)
 - Copilot behavior and execution instructions: [.github/copilot-instructions.md](../../.github/copilot-instructions.md)
-- Skill definition in use: [.claude/skills/create-image/SKILL.md](../../.claude/skills/create-image/SKILL.md)
+- Skill definition in use: [skills/create-image/SKILL.md](../../skills/create-image/SKILL.md)
 
 ### 2.3 Adding New Component Skills
 
 When adding a new component skill:
 
 1. Add or update the nearest AGENTS.md in that component path.
-2. Create the new skill at `.claude/skills/<skill-id>/SKILL.md.`
+2. Create the new skill at `skills/<skill-id>/SKILL.md.`
 3. Ensure CLAUDE.md and .github/copilot-instructions.md continue to point to the same execution contract.
 4. Keep one authoritative source per file, and avoid duplicating template versions in docs.
 
@@ -108,13 +106,13 @@ Good first candidates:
 
 ### 3.2 Reuse the Existing SKILL.md Contract
 
-Use [.claude/skills/create-image/SKILL.md](../../.claude/skills/create-image/SKILL.md) as the baseline contract and copy its structure for new skills.
+Use [skills/create-image/SKILL.md](../../skills/create-image/SKILL.md) as the baseline contract and copy its structure for new skills.
 
 ### 3.3 Keep SKILL.md Thin and Put Logic in Component Scripts
 
 Put detailed execution in existing component scripts where possible so SKILL.md stays readable and maintainable.
 
-If needed, add skill-local scripts under .claude/skills/<skill-id>/scripts/.
+If needed, add skill-local scripts under skills/<skill-id>/scripts/.
 
 Examples:
 
@@ -151,14 +149,14 @@ Once your skill is written and tested, add tool-specific instructions so Claude,
 
 | Tool | File to edit | Instruction to add |
 |------|-------------|--------------------|
-| Claude Code | CLAUDE.md | Discover skills from .claude/skills/, select by trigger phrase, execute in SKILL.md order: inputs → preconditions → steps → validation → rollback. |
+| Claude Code | CLAUDE.md | Discover skills from skills/, select by trigger phrase, execute in SKILL.md order: inputs → preconditions → steps → validation → rollback. |
 | GitHub Copilot | .github/copilot-instructions.md | Use AGENTS.md as skill catalog, execute matching SKILL.md flow, do not skip preconditions or validation. |
 
 ## Part 6: How Customers Use Skills
 
 ### 6.1 Customer Journey
 
-1. **Customer clones the SDK or workspace.** The repo includes `AGENTS.md` with the platform overview, `CLAUDE.md` listing available skills, `.claude/skills/` with tested skill definitions.
+1. **Customer clones the SDK or workspace.** The repo includes `AGENTS.md` with the platform overview, `CLAUDE.md` listing available skills, `skills/` with tested skill definitions.
 
 2. **Agent reads `AGENTS.md` and `CLAUDE.md` for context.** This gives the agent the component map, available skills, build order, and constraints before any user prompt is processed.
 
@@ -174,18 +172,9 @@ Once your skill is written and tested, add tool-specific instructions so Claude,
 
 ### 6.2 Slash Commands Usage
 
-Slash commands are used to run repeatable multi-step flows that call one or more skills in a fixed order.
+Slash commands are used to run repeatable multi-step flows that call one or more skills in a fixed order. They are an optional, Claude-specific surface; in this repository the canonical execution contracts are the `SKILL.md` files under `skills/`, and slash commands are not maintained.
 
-Recommended location: `.claude/commands/create-image.md`
-
-Typical usage:
-
-```
-1. /create-image <target-profile>
-2. /deploy-plugins <gpu|npu>
-3. /deploy-apps <app-profile>
-4. /run-benchmark <suite>
-```
+If you choose to add them for Claude Code, the conventional location is `.claude/commands/<name>.md`.
 
 Command behavior should follow the same safety model as skills:
 
@@ -198,5 +187,5 @@ Command behavior should follow the same safety model as skills:
 
 1. Skills are the contract between platform teams and customer experience.
 2. Keep each skill component-specific and testable.
-3. Keep SKILL.md in .claude/skills and reuse component scripts when possible.
+3. Keep SKILL.md in skills/ and reuse component scripts when possible.
 4. Design every skill for both author usability and customer usability.
