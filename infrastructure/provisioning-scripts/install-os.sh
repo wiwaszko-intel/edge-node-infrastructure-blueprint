@@ -19,6 +19,9 @@ deploy_mode="real"
 user_apps_data="false"
 LOG_FILE="/var/log/os-installer.log"
 lvm_size=""
+USER_SELECTED_DISK=""
+CUSTOM_PARTITIONS=""
+proxy_settings="false"
 #########################
 
 # Color codes for output
@@ -46,6 +49,19 @@ exec 3>>"$LOG_FILE"
 
 # Send 'set -x' traces to descriptor 3
 export BASH_XTRACEFD="3"
+
+# Parse command line arguments
+if [[ -z "$1" ]]; then
+    ATTENDEDMODE="false"
+elif [[ "$1" == "-i" ]]; then
+    ATTENDEDMODE="true"
+else
+    echo -e "${RED}ERROR: Invalid argument '$1'${NC}"
+    echo "Usage:"
+    echo "  /usr/local/bin/os-install.sh              # Run in UNATTENDED mode (config-file: installation_mode=false)"
+    echo "  /usr/local/bin/os-install.sh -i           # Run in ATTENDED mode (config-file: installation_mode=true)"
+    exit 1
+fi
 
 set -x
 
@@ -123,6 +139,11 @@ get_usb_details() {
         umount /mnt
         return 1 
     fi
+    # Check for installation_mode=true in config-file to set attended mode/ unattended mode
+    installation_mode=$(grep '^installation_mode=' "/mnt/config-file" | cut -d '=' -f2 | tr -d '"')
+        if [ "$installation_mode" == "true" ]; then
+            ATTENDEDMODE="true"
+        fi
     umount /mnt
     return 0
 }
@@ -161,17 +182,44 @@ get_block_device_details() {
         dd if=/dev/zero of="/dev/$disk_name" bs=100M count=20
 	wipefs --all "/dev/$disk_name"
     done
-    # Remove previous LVM's data if exist
-    #vgname="lvmvg"
-    #vgremove -f "$vgname"
-    #rm -rf  "/dev/${vgname:?}/"
-    #rm -rf  /dev/mapper/lvmvg-pv*
-    #dmsetup remove_all
-    # Remove previous Physical volumes if exist
-    #for pv_disk in $(pvscan 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^\/dev\//) print $i}'); do
-    #    echo "Removing LVM metadata from $pv_disk"
-    #    pvremove -ff -y "$pv_disk"
-    #done
+    return 0
+}
+
+# Attended MODE 
+print_block_device_details() {
+    echo -e "${BLUE}Print the block device for OS installation${NC}"
+    TTY=/dev/tty1 
+    local TMPFILE DIALOG_EXIT
+
+    # List all the available disks with size and model, ignore USB and loopback devices 
+    DISK_LIST=""
+    for disk in $(lsblk -dn -o NAME,TYPE,SIZE,TRAN | awk '$2 == "disk" && $4 ~ /^(sata|nvme)$/ && $3 != "0B" {print $1}'); do
+        SIZE=$(lsblk -dn -o SIZE /dev/$disk 2>/dev/null)
+        MODEL=$(lsblk -dn -o MODEL /dev/$disk 2>/dev/null | tr ' ' '_')
+        MODEL=${MODEL:-"Unknown"}
+        DISK_LIST="$DISK_LIST /dev/$disk ${SIZE}-${MODEL}"
+    done
+
+    if [ -z "$DISK_LIST" ]; then
+        echo "No disks found!" >>/dev/tty1
+        return 1
+    fi
+
+    TMPFILE=$(mktemp /tmp/dialog.XXXXXX)
+    dialog --title "Disk Selection" --menu "Choose disk for OS install:" 0 0 0 $DISK_LIST </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+    DIALOG_EXIT=$?
+
+    USER_SELECTED_DISK=$(cat "$TMPFILE")
+    rm -f "$TMPFILE"
+    clear >/dev/tty1
+
+    if [ $DIALOG_EXIT -ne 0 ] || [ -z "$USER_SELECTED_DISK" ]; then
+        echo "No disk selected. Aborting." >>/dev/tty1
+        return 1
+    fi
+
+    echo "User selected: $USER_SELECTED_DISK"
+    os_disk="$USER_SELECTED_DISK"
     return 0
 }
 
@@ -193,6 +241,7 @@ install_os_on_disk() {
             umount /mnt
             partprobe "$os_disk" && sync
             blockdev --rereadpt "$os_disk"
+	    udevadm settle --timeout=15
             sleep 5
         else
             failure "Failed to Install OS on the Disk $os_disk, please check!!"
@@ -224,7 +273,633 @@ install_os_on_disk() {
 
     return 0
 }
+# Attended MODE - User account creation with dialog
+create_user_account() {
+    echo -e "${BLUE}Create a new user account${NC}"
+    TTY=/dev/tty1
+    local TMPFILE=$(mktemp /tmp/dialog.XXXXXX)
+    trap "rm -f '$TMPFILE'" RETURN
+    
+    # Ask if user wants to create an account 
+    if ! dialog --title "User Account" \
+        --yesno "Do you want to create a user account?\n\n(Select 'No' to skip if you have already created a user account)" \
+        0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"; then
+        echo "User account creation skipped." >> $LOG
+        return 0
+    fi
 
+    # Ask for username 
+    while true; do
+        if ! dialog --title "User Account" \
+            --inputbox "Enter username:" 0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"; then
+            return 0
+        fi
+        
+        USERNAME=$(cat "$TMPFILE")
+
+        # Empty username
+        if [ -z "$USERNAME" ]; then
+            dialog --title "Error" --msgbox "Username cannot be empty!" \
+                0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+            continue
+        fi
+
+        # Validate username (only lowercase, numbers, underscore, hyphen)
+        if ! echo "$USERNAME" | grep -qE '^[a-z][a-z0-9_-]*$'; then
+            dialog --title "Error" \
+                --msgbox "Invalid username!\nMust start with a letter.\nOnly lowercase, numbers, _ and - allowed." \
+                0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+            continue
+        fi
+
+        break 
+    done
+
+    # Ask password 
+    while true; do
+        # Enter password
+        if ! dialog --title "User Account" \
+            --passwordbox "Enter password for '$USERNAME':" 0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"; then
+            return 0
+        fi
+        PASSWORD=$(cat "$TMPFILE")
+
+        # Confirm password
+        if ! dialog --title "User Account" \
+            --passwordbox "Confirm password for '$USERNAME':" 0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"; then
+            return 0
+        fi
+        PASSWORD_CONFIRM=$(cat "$TMPFILE")
+
+        # Check empty
+        if [ -z "$PASSWORD" ]; then
+            dialog --title "Error" --msgbox "Password cannot be empty!" \
+                0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+            continue
+        fi
+
+        # Check match
+        if [ "$PASSWORD" != "$PASSWORD_CONFIRM" ]; then
+            dialog --title "Error" \
+                --msgbox "Passwords do not match! Please try again." \
+                0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+            continue
+        fi
+
+        break 
+    done
+    
+    # Create user account inside the chroot environment of the installed OS
+    check_mnt_mount_exist
+    mount "$os_disk$os_rootfs_part" /mnt
+    
+    # Check if user already exists
+    chroot /mnt /bin/bash <<EOT
+id $USERNAME >/dev/null 2>&1
+EOT
+    
+    if [ $? -eq 0 ]; then
+        dialog --title "User Exists" \
+            --msgbox "User '$USERNAME' already exists!" \
+            0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+        echo "User $USERNAME already exists." >> $LOG
+        return 0
+    fi
+    
+    # Create user account if not exists
+    chroot /mnt /bin/bash <<EOT
+set -e
+useradd -m -s /bin/bash $USERNAME && echo "$USERNAME:$PASSWORD" | chpasswd && echo '$USERNAME ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/$USERNAME
+EOT
+    
+    if [ $? -eq 0 ]; then
+        dialog --title "Success" \
+            --msgbox "User '$USERNAME' created successfully!" \
+            0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+        echo "User $USERNAME created successfully." >> $LOG
+    else
+        dialog --title "Error" \
+            --msgbox "Failed to create user '$USERNAME'!\nCheck $LOG for details." \
+            0 0 </dev/tty1 >/dev/tty1 2>/dev/null
+        return 1
+    fi
+    clear >/dev/tty1
+    return 0
+}
+# Attended MODE - Custom partition setup with dialog
+create_partitions() {
+
+    echo -e "${BLUE}Custom Partition Setup${NC}"
+    TTY=/dev/tty1
+    local tmpfile disk_total_mb rootfs_size_mb existing_partitions_mb free_mb free_gb rootfs_size_gb remaining_mb remaining_gb current_layout partition_num
+    
+    tmpfile=$(mktemp /tmp/dialog.XXXXXX)
+    CUSTOM_PARTITIONS=""
+    partition_num=1
+    
+    # Ask if user wants to create custom partitions or use default layout
+    dialog --title "Partition Setup" \
+        --yesno "Do you want to create custom partitions?\n\n(Select 'No' to use default layout)" \
+        0 0 <$TTY >$TTY 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log "Using default partition layout."
+        rm -f "$tmpfile"
+        return 0
+    fi
+    
+    ROOTFS_PARTITION="${os_disk}${os_rootfs_part}"
+    ROOTFS_PART_NUM=$(echo "$os_rootfs_part" | tr -dc '0-9')
+    
+    # Get total disk size
+    disk_total_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null | grep "^Disk" | cut -d: -f2 | tr -d 'MB ')
+    # Get current rootfs partition size
+    rootfs_size_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null \
+        | awk -v p="$ROOTFS_PART_NUM" '
+            $1 == p {
+                val=$4
+                sub("MB","",val)
+                split(val,a,".")
+                print a[1]
+            }')
+   
+    # Get the default partition sizes of existing partitions to calculate free space
+    existing_partitions_mb=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null \
+        | awk '
+            $1 ~ /^[0-9]+$/ {
+                val=$4
+                sub("MB","",val)
+                split(val,a,".")
+                total+=a[1]
+            }
+            END {
+                print total+0
+            }')
+    [ -z "$disk_total_mb" ] && disk_total_mb=0
+    [ -z "$rootfs_size_mb" ] && rootfs_size_mb=0
+    [ -z "$existing_partitions_mb" ] && existing_partitions_mb=0
+   
+    # Get free space available for partitioning
+    free_mb=$((disk_total_mb - existing_partitions_mb))
+    if [ "$free_mb" -lt 0 ]; then
+        free_mb=0
+    fi
+    free_gb=$((free_mb / 1024))
+    rootfs_size_gb=$((rootfs_size_mb / 1024))
+    FREE_MB=$free_mb
+    FREE_GB=$free_gb
+    
+    current_layout=$(parted -s "$USER_SELECTED_DISK" unit MB print 2>/dev/null)
+    dialog \
+        --title "Current Disk Layout — $USER_SELECTED_DISK" \
+        --msgbox "$current_layout
+
+─────────────────────────────────
+Disk Size            : $((disk_total_mb / 1024))GB
+Existing Partitions  : $((existing_partitions_mb / 1024))GB
+Available Free Space : ${free_gb}GB
+
+Current Rootfs Size  : ${rootfs_size_gb}GB
+
+Rootfs Needs to be resized first to accommodate additional space." \
+        0 0 <$TTY >$TTY 2>/dev/null
+    while true; do
+        dialog \
+            --title "Resize Rootfs" \
+            --inputbox "Current rootfs size : ${rootfs_size_gb}GB
+
+Enter ADDITIONAL size in GB.
+
+Example:
+Current : 40
+Input   : 20
+Final   : 60
+
+Available free space : ${free_gb}GB" \
+            0 0 \
+            <$TTY >$TTY 2>"$tmpfile"
+        if [ $? -ne 0 ]; then
+            rm -f "$tmpfile"
+            return 1
+        fi
+        ROOTFS_ADDITIONAL_GB=$(cat "$tmpfile")
+        if ! echo "$ROOTFS_ADDITIONAL_GB" | grep '^[0-9][0-9]*$' >/dev/null; then
+            dialog --title "Error" \
+                --msgbox "Enter valid numeric size." \
+                0 0 <$TTY >$TTY 2>/dev/null
+            continue
+        fi
+        ROOTFS_ADDITIONAL_MB=$((ROOTFS_ADDITIONAL_GB * 1024))
+        if [ "$ROOTFS_ADDITIONAL_MB" -gt "$free_mb" ]; then
+            dialog --title "Error" \
+                --msgbox "Requested size exceeds available free space." \
+                0 0 <$TTY >$TTY 2>/dev/null
+            continue
+        fi
+        ROOTFS_FINAL_MB=$((rootfs_size_mb + ROOTFS_ADDITIONAL_MB))
+        ROOTFS_FINAL_GB=$((ROOTFS_FINAL_MB / 1024))
+        dialog \
+            --title "Confirm Rootfs Resize" \
+            --yesno "Resize rootfs from
+
+        ${rootfs_size_gb}GB → ${ROOTFS_FINAL_GB}GB ?" \
+            0 0 <$TTY >$TTY 2>/dev/null
+        if [ $? -eq 0 ]; then
+            CUSTOM_PARTITIONS="/ $ROOTFS_FINAL_MB ext4"
+            FREE_MB=$((FREE_MB - ROOTFS_ADDITIONAL_MB))
+            break
+        fi
+    done
+    
+    while true; do
+        remaining_mb=$FREE_MB
+        remaining_gb=$((remaining_mb / 1024))
+        if [ "$remaining_mb" -le 0 ]; then
+            dialog --title "Partition Setup" \
+                --msgbox "No remaining free space available." \
+                0 0 <$TTY >$TTY 2>/dev/null
+            break
+        fi
+        
+        # Partition type
+        dialog \
+            --title "Custom Partition Type — Slot $partition_num" \
+            --menu "Choose partition type you want to create:" \
+            0 0 0 \
+            data "Data partition" \
+            swap "Swap partition" \
+            2>"$tmpfile" <$TTY >$TTY
+        if [ $? -ne 0 ]; then
+            break
+        fi
+        PART_TYPE=$(cat "$tmpfile")
+        if [ "$PART_TYPE" = "swap" ]; then
+            MOUNTPOINT="swap"
+        else
+            while true; do
+                dialog \
+                    --title "Partition $partition_num — Mount Point" \
+                    --inputbox "Enter mount point
+Examples:
+/home
+/data
+/var
+
+Leave empty to finish." \
+                    0 0 \
+                    <$TTY >$TTY 2>"$tmpfile"
+                if [ $? -ne 0 ]; then
+                    break 2
+                fi
+                MOUNTPOINT=$(cat "$tmpfile")
+                [ -z "$MOUNTPOINT" ] && break 2
+                if ! echo "$MOUNTPOINT" \
+                    | grep '^/[a-zA-Z0-9/_-]*$' >/dev/null; then
+                    dialog --title "Error" \
+                        --msgbox "Invalid mount point." \
+                        0 0 <$TTY >$TTY 2>/dev/null
+                    continue
+                fi
+                # Duplicate check
+                if echo "$CUSTOM_PARTITIONS" \
+                    | awk '{print $1}' \
+                    | grep -x "$MOUNTPOINT" >/dev/null; then
+                    dialog --title "Error" \
+                        --msgbox "Mount point already exists." \
+                        0 0 <$TTY >$TTY 2>/dev/null
+                    continue
+                fi
+                break
+            done
+        fi
+       
+        # Partition size
+        while true; do
+            remaining_mb=$FREE_MB
+            remaining_gb=$((remaining_mb / 1024))
+            dialog \
+                --title "Partition $partition_num — Size" \
+                --inputbox "Enter partition size in GB
+
+Remaining free space : ${remaining_gb}GB" \
+                0 0 \
+                <$TTY >$TTY 2>"$tmpfile"
+            if [ $? -ne 0 ]; then
+                break 2
+            fi
+            PART_SIZE_GB=$(cat "$tmpfile")
+            if ! echo "$PART_SIZE_GB" \
+                | grep '^[0-9][0-9]*$' >/dev/null; then
+                dialog --title "Error" \
+                    --msgbox "Invalid numeric size." \
+                    0 0 <$TTY >$TTY 2>/dev/null
+                continue
+            fi
+            if [ "$PART_SIZE_GB" -le 0 ]; then
+                dialog --title "Error" \
+                    --msgbox "Size must be greater than 0." \
+                    0 0 <$TTY >$TTY 2>/dev/null
+                continue
+            fi
+            PART_SIZE_MB=$((PART_SIZE_GB * 1024))
+            if [ "$PART_SIZE_MB" -gt "$remaining_mb" ]; then
+                dialog --title "Error" \
+                    --msgbox "Partition exceeds remaining free space." \
+                    0 0 <$TTY >$TTY 2>/dev/null
+                continue
+            fi
+            break
+        done
+       
+        if [ "$PART_TYPE" = "swap" ]; then
+            FSTYPE="swap"
+        else
+            dialog \
+                --title "Partition $partition_num — Filesystem" \
+                --menu "Choose filesystem:" \
+                0 0 0 \
+                ext4  "Standard Linux filesystem" \
+                xfs   "High performance filesystem" \
+                btrfs "Snapshot capable filesystem" \
+                vfat  "FAT32 filesystem" \
+                <$TTY >$TTY 2>"$tmpfile"
+            if [ $? -ne 0 ]; then
+                break 2
+            fi
+            FSTYPE=$(cat "$tmpfile")
+        fi
+        if [ "$PART_TYPE" = "swap" ]; then
+            CONFIRM_MSG="Add swap partition?
+
+Size : ${PART_SIZE_GB}GB"
+        else
+            CONFIRM_MSG="Add partition?
+
+Mount Point : $MOUNTPOINT
+Size        : ${PART_SIZE_GB}GB
+Filesystem  : $FSTYPE"
+        fi
+        dialog \
+            --title "Confirm Partition $partition_num" \
+            --yesno "$CONFIRM_MSG" \
+            0 0 <$TTY >$TTY 2>/dev/null
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        CUSTOM_PARTITIONS="$CUSTOM_PARTITIONS
+$MOUNTPOINT $PART_SIZE_MB $FSTYPE"
+        FREE_MB=$((FREE_MB - PART_SIZE_MB))
+        partition_num=$((partition_num + 1))
+        remaining_mb=$FREE_MB
+        remaining_gb=$((remaining_mb / 1024))
+        dialog \
+            --title "Partition Setup" \
+            --yesno "Partition added.
+
+Remaining free space : ${remaining_gb}GB
+
+Add another partition?" \
+            0 0 <$TTY >$TTY 2>/dev/null
+        if [ $? -ne 0 ]; then
+            break
+        fi
+    done
+    
+    # Show summary of partitions to be created and confirm before applying
+    if [ -n "$CUSTOM_PARTITIONS" ]; then
+        SUMMARY=""
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            MP=$(echo "$line" | awk '{print $1}')
+            SZ=$(echo "$line" | awk '{print $2}')
+            FS=$(echo "$line" | awk '{print $3}')
+            SZ_GB=$((SZ / 1024))
+            if [ "$MP" = "/" ]; then
+                SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' 'rootfs' "$SZ_GB" "$FS")\n"
+            elif [ "$FS" = "swap" ]; then
+                SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' '[swap]' "$SZ_GB" 'swap')\n"
+            else
+                SUMMARY="${SUMMARY}$(printf '%-12s : %6sGB  %s\n' "$MP" "$SZ_GB" "$FS")\n"
+            fi
+        done <<EOF
+$CUSTOM_PARTITIONS
+EOF
+        dialog \
+            --title "Final Partition Layout — $USER_SELECTED_DISK" \
+            --yesno "Review partition layout:
+
+$SUMMARY
+
+Proceed with partitioning?" \
+            0 0 <$TTY >$TTY 2>/dev/null
+        if [ $? -ne 0 ]; then
+            dialog \
+                --title "Partition Setup" \
+                --yesno "Do you want to restart partition setup?" \
+                0 0 <$TTY >$TTY 2>/dev/null
+            if [ $? -eq 0 ]; then
+                rm -f "$tmpfile"
+                CUSTOM_PARTITIONS=""
+                create_partitions
+                return $?
+            else
+                CUSTOM_PARTITIONS=""
+                rm -f "$tmpfile"
+                return 0
+            fi
+        fi
+        apply_partitions || {
+            rm -f "$tmpfile"
+            return 1
+        }
+    fi
+    rm -f "$tmpfile"
+    return 0
+}
+
+apply_partitions() {
+    echo -e "${BLUE}Applying custom partitions on $USER_SELECTED_DISK${NC}"
+
+    # Fix the disk label if needed to avoid parted errors when modifying partitions    
+    echo "Fix" | parted ---pretend-input-tty "$USER_SELECTED_DISK" print
+
+    sgdisk -e "$USER_SELECTED_DISK"
+
+    # Prepare fstab entries for new partitions
+    FSTAB_ENTRIES=""
+    PARTITION_NUM_LIST=""
+    
+    # Loop through collected partitions
+    START_MB=$(parted -s "$USER_SELECTED_DISK" unit MB print \
+        | awk '/^ [0-9]/ {print $3}' \
+        | tr -d 'MB' \
+        | sort -n \
+        | tail -1)
+    START_MB=${START_MB:-1}
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+
+        MP=$(echo "$line" | awk '{print $1}')
+        SZ=$(echo "$line" | awk '{print $2}')
+        FS=$(echo "$line" | awk '{print $3}')
+        END_MB=$((START_MB + SZ))
+
+        # Handle rootfs resize (when MP is "/" and it's the first entry)
+        if [ "$MP" = "/" ]; then
+            echo "Resizing rootfs partition to ${SZ}MB"
+            ROOTFS_PART_NUM=$(parted -s "$USER_SELECTED_DISK" print \
+                | awk '/^ [0-9]/ {print $1}' \
+                | sort -n \
+                | tail -1)
+            if [ -n "$ROOTFS_PART_NUM" ]; then
+                ROOTFS_START=$(parted -s "$USER_SELECTED_DISK" unit MB print \
+                    | awk "/ $ROOTFS_PART_NUM / {print \$2}" \
+                    | tr -d 'MB')
+                ROOTFS_NEW_END=$((ROOTFS_START + SZ))
+                parted -s "$USER_SELECTED_DISK" resizepart "$ROOTFS_PART_NUM" "${ROOTFS_NEW_END}MB" 2>/dev/null || true
+                resize2fs "${USER_SELECTED_DISK}${ROOTFS_PART_NUM}" 2>/dev/null || true
+                blockdev --rereadpt "$USER_SELECTED_DISK" 2>/dev/null || true
+                sleep 1
+                START_MB=$ROOTFS_NEW_END
+            fi
+        else
+            # Create new partition
+            echo "Creating partition: $MP ${START_MB}MB → ${END_MB}MB ($FS)"
+
+            # Add partition without touching existing ones
+            parted -s "$USER_SELECTED_DISK" mkpart primary \
+                "${START_MB}MB" "${END_MB}MB" 
+
+            # Get the new partition number
+            PART_NUM=$(parted -s "$USER_SELECTED_DISK" print \
+                | awk '/^ [0-9]/ {print $1}' \
+                | sort -n \
+                | tail -1)
+
+            # Construct partition path
+            PART_PATH="${USER_SELECTED_DISK}${PART_NUM}"
+            if [[ "$USER_SELECTED_DISK" == *"nvme"* ]]; then
+                PART_PATH="${USER_SELECTED_DISK}p${PART_NUM}"
+            fi
+
+            # Format
+            case "$FS" in
+                ext4)  mkfs.ext4  -F "$PART_PATH"  ;;
+                xfs)   mkfs.xfs   -f "$PART_PATH"  ;;
+                btrfs) mkfs.btrfs -f "$PART_PATH"  ;;
+                vfat)  mkfs.vfat     "$PART_PATH"  ;;
+                swap)
+                    mkswap "$PART_PATH" 
+                    blockdev --rereadpt ${USER_SELECTED_DISK}
+                    swapon "$PART_PATH" 
+                    ;;
+            esac
+
+            echo " Created $PART_PATH → $MP (${SZ}MB $FS)"
+            PARTITION_NUM_LIST="${PARTITION_NUM_LIST}${PART_NUM} "
+
+            # Generate fstab entry 
+            PART_UUID=$(blkid -s UUID -o value "$PART_PATH")
+            if [ -z "$PART_UUID" ]; then
+                PART_UUID="$PART_PATH"
+            fi
+            
+            if [ "$FS" = "swap" ]; then
+                FSTAB_ENTRIES="${FSTAB_ENTRIES}UUID=$PART_UUID none swap sw 0 0"$'\n'
+            else
+                MOUNT_OPTS="defaults"
+                if [ "$FS" = "xfs" ]; then
+                    MOUNT_OPTS="defaults,relatime"
+                fi
+                FSTAB_ENTRIES="${FSTAB_ENTRIES}UUID=$PART_UUID $MP $FS $MOUNT_OPTS 0 2"$'\n'
+            fi
+
+            START_MB=$END_MB
+        fi
+
+    done <<< "$CUSTOM_PARTITIONS"
+
+    # Verify all created partitions exist
+    echo "Verifying all partitions created by user..."
+    RETRY_COUNT=0
+    MAX_RETRIES=5
+    
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        ALL_EXIST=true
+        if [ -z "$PARTITION_NUM_LIST" ]; then
+            echo "No partitions created. PARTITION_NUM_LIST is empty"
+            ALL_EXIST=true
+        else
+            for PNUM in $PARTITION_NUM_LIST; do
+                PART_PATH="${USER_SELECTED_DISK}${PNUM}"
+                if [[ "$USER_SELECTED_DISK" == *"nvme"* ]]; then
+                    PART_PATH="${USER_SELECTED_DISK}p${PNUM}"
+                fi
+                if [ ! -b "$PART_PATH" ]; then
+                    ALL_EXIST=false
+                    break
+                fi
+            done
+        fi
+        
+        if [ "$ALL_EXIST" = false ]; then
+            echo "Not all partitions found. Retrying..."
+            umount "${USER_SELECTED_DISK}"* 2>/dev/null || true
+            blockdev --rereadpt "$USER_SELECTED_DISK" 2>/dev/null || blockdev --flushbufs "$USER_SELECTED_DISK" 2>/dev/null || true
+            sleep 2
+            ((RETRY_COUNT++))
+        else
+            echo "All partitions verified successfully"
+            break
+        fi
+    done
+    
+    if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+        echo "Warning: Could not verify all partitions after $MAX_RETRIES retries"
+        return 1
+    fi
+
+    # Add fstab entries to target system
+    if [ -n "$FSTAB_ENTRIES" ]; then
+        check_mnt_mount_exist
+        if mount "$os_disk$os_rootfs_part" /mnt 2>/dev/null; then
+            if [ -f /mnt/etc/fstab ]; then
+                echo "Adding new partition entries to /etc/fstab"
+                echo -e "$FSTAB_ENTRIES" >> /mnt/etc/fstab
+                
+                if [ $? -eq 0 ]; then
+                    success "fstab entries added successfully"
+                else
+                    error "Failed to write fstab entries"
+                    return 1
+                fi
+            else
+                error "/mnt/etc/fstab not found"
+                return 1
+            fi
+            umount /mnt 2>/dev/null || true
+        else
+            error "Failed to mount $os_disk$os_rootfs_part at /mnt"
+        fi
+    fi
+
+    if [ "$?" -eq 0 ]; then 
+
+    dialog \
+        --title "Partitioning Complete" \
+        --msgbox "All partitions created successfully!.\nfstab entries added for new partitions." \
+        0 0 <$TTY >$TTY 2>/dev/null
+    else
+
+    dialog \
+        --title "Partitioning Creation Failed" \
+        --msgbox "Partition Creation Failed,please check!!" \
+        0 0 <$TTY >$TTY 2>/dev/null
+        return 1
+    fi
+     clear >/dev/tty1
+    return 0
+}
 # Install cloud-init file on OS
 install_cloud_init_file() {
 
@@ -233,7 +908,9 @@ install_cloud_init_file() {
 
 
     CLOUD_INIT_FILE="/etc/scripts/cloud-init.yaml"
-    custom_cloud_init_updates
+    if ! custom_cloud_init_updates; then
+        return 1
+    fi
     sync
     check_mnt_mount_exist
     mount "$os_disk$os_rootfs_part" /mnt
@@ -297,7 +974,7 @@ setup_proxy_settings() {
         HTTPS_PROXY=$(read_cfg HTTPS_PROXY)
         NO_PROXY=$(read_cfg NO_PROXY)
 
-        # Apply to /etc/environment – replace stale entries or append.
+	# Apply to /etc/environment – replace stale entries or append.
         # Also handle socks_server and ftp_proxy which are baked into the image
         # by both the QEMU (auto-install-pkgs.yaml) and ICT build paths but are
         # not sourced from config-file.  Derive their values from http_proxy so
@@ -305,6 +982,13 @@ setup_proxy_settings() {
         ftp_proxy="$http_proxy"
         socks_server=""
 
+        if [ -n "$http_proxy" ] || [ -n "$https_proxy" ] || [ -n "$no_proxy" ]; then
+            proxy_settings="true"
+        else
+            proxy_settings="false"
+        fi
+         
+        # Apply to /etc/environment – replace stale entries or append
         ENV_FILE="/mnt/etc/environment"
         # Deduplicate: remove all existing proxy lines first, then write once
         sed -i '/^\(http_proxy\|https_proxy\|no_proxy\|HTTP_PROXY\|HTTPS_PROXY\|NO_PROXY\|ftp_proxy\|FTP_PROXY\|socks_server\)=/d' "$ENV_FILE"
@@ -348,6 +1032,177 @@ EOF
         return 1
     fi
 }
+# Ask for proxy settings in Attended MODE with dialog
+ask_for_proxy_settings(){
+    echo -e "${BLUE}Configure Proxy Settings (Optional)${NC}"
+    TTY=/dev/tty1
+    local TMPFILE=$(mktemp /tmp/dialog.XXXXXX)
+    trap "rm -f '$TMPFILE'" RETURN
+
+    dialog --title "Proxy Configuration" \
+        --yesno "Do you want to configure proxy settings?" \
+        0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+    if [ $? -ne 0 ]; then
+        echo "Proxy configuration skipped." 
+        return 0
+    fi
+
+    # Ask for HTTP_PROXY
+    while true; do
+        dialog --title "Proxy Configuration" \
+            --inputbox "Enter HTTP proxy URL (e.g. http://proxy.example.com:8080):" \
+            0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+        if [ $? -ne 0 ]; then
+            echo "HTTP proxy configuration skipped." 
+            return 0
+        fi
+
+        HTTP_PROXY=$(cat "$TMPFILE")
+        
+        if [ -z "$HTTP_PROXY" ]; then
+            dialog --title "Proxy Configuration" \
+                --yesno "No HTTP proxy value provided. Continue without HTTP proxy?" \
+                0 0 </dev/tty1 >/dev/tty1 2>&1
+            if [ $? -eq 0 ]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
+
+    # Ask for HTTPS_PROXY
+    while true; do
+        dialog --title "Proxy Configuration" \
+            --inputbox "Enter HTTPS proxy URL (e.g. https://proxy.example.com:8080):" \
+            0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+        if [ $? -ne 0 ]; then
+            echo "HTTPS proxy configuration skipped." 
+            return 0
+        fi
+
+        HTTPS_PROXY=$(cat "$TMPFILE")
+        
+        if [ -z "$HTTPS_PROXY" ]; then
+            dialog --title "Proxy Configuration" \
+                --yesno "No HTTPS proxy value provided. Continue without HTTPS proxy?" \
+                0 0 </dev/tty1 >/dev/tty1 2>&1
+            if [ $? -eq 0 ]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
+
+    # Ask for FTP_PROXY
+    while true; do
+        dialog --title "Proxy Configuration" \
+            --inputbox "Enter FTP proxy URL (e.g. ftp://proxy.example.com:8080):" \
+            0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+        if [ $? -ne 0 ]; then
+            echo "FTP proxy configuration skipped."
+            break
+        fi
+
+        FTP_PROXY=$(cat "$TMPFILE")
+        
+        if [ -z "$FTP_PROXY" ]; then
+            dialog --title "Proxy Configuration" \
+                --yesno "No FTP proxy value provided. Continue without FTP proxy?" \
+                0 0 </dev/tty1 >/dev/tty1 2>&1
+            if [ $? -eq 0 ]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
+
+    # Ask for SOCKS_SERVER
+    while true; do
+        dialog --title "Proxy Configuration" \
+            --inputbox "Enter SOCKS server (e.g. socks5://proxy.example.com:1080):" \
+            0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+        if [ $? -ne 0 ]; then
+            echo "SOCKS server configuration skipped." 
+            break
+        fi
+
+        SOCKS_SERVER=$(cat "$TMPFILE")
+        
+        if [ -z "$SOCKS_SERVER" ]; then
+            dialog --title "Proxy Configuration" \
+                --yesno "No SOCKS server value provided. Continue without SOCKS server?" \
+                0 0 </dev/tty1 >/dev/tty1 2>&1
+            if [ $? -eq 0 ]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
+
+    # Ask for NO_PROXY
+    while true; do
+        dialog --title "Proxy Configuration" \
+            --inputbox "Enter NO_PROXY domains (comma-separated, e.g. localhost,127.0.0.1):" \
+            0 0 </dev/tty1 >/dev/tty1 2>"$TMPFILE"
+
+        if [ $? -ne 0 ]; then
+            echo "NO_PROXY configuration skipped." 
+            return 0
+        fi
+
+        NO_PROXY=$(cat "$TMPFILE")
+        
+        if [ -z "$NO_PROXY" ]; then
+            dialog --title "Proxy Configuration" \
+                --yesno "No NO_PROXY value provided. Continue without NO_PROXY?" \
+                0 0 </dev/tty1 >/dev/tty1 2>&1
+            if [ $? -eq 0 ]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
+    # Save to a temporary file for later use
+    {
+        echo "http_proxy=\"$HTTP_PROXY\""
+        echo "https_proxy=\"$HTTPS_PROXY\""
+        [ -n "$FTP_PROXY" ] && echo "ftp_proxy=\"$FTP_PROXY\""
+        [ -n "$SOCKS_SERVER" ] && echo "socks_server=\"$SOCKS_SERVER\""
+        echo "no_proxy=\"$NO_PROXY\""
+    } > "$TMPFILE"
+
+    # Mount the rootfs and add proxy settings to /etc/environment
+    check_mnt_mount_exist
+    mount "${os_disk}${os_rootfs_part}" /mnt
+    cat "$TMPFILE" >> /mnt/etc/environment
+    if [ $? -ne 0 ]; then
+        dialog --title "Error" \
+            --msgbox "Failed to save proxy settings to /etc/environment" \
+            0 0 </dev/tty1 >/dev/tty1 2>&1
+        failure "Failed to save proxy settings to /etc/environment"
+        umount /mnt
+        clear >/dev/tty1
+        return 1
+    fi
+    umount /mnt
+    dialog --title "Success" \
+        --msgbox "Proxy settings saved and will be applied on first boot" \
+        0 0 </dev/tty1 >/dev/tty1 2>&1
+    success "Proxy settings saved and will be applied on first boot"
+    clear >/dev/tty1
+    return 0    
+}
+    
 
 # Update  SSH config settings
 update_ssh_settings() {
@@ -517,7 +1372,7 @@ EOF
         #
         ############################################################
          # Docker configuration
-	  NEW_LINES=$(cat <<'EOF'
+	  NEW_LINES=$(cat <<EOF
          systemctl disable k3s
          systemctl stop k3s
          bash /opt/edge/scripts/container-provision.sh
@@ -582,7 +1437,7 @@ EOT
              umount  /mnt/proc
              umount  /mnt/sys
              umount /mnt
-             exit 1
+             return 1
          fi
          umount  /mnt/proc
          umount  /mnt/sys
@@ -631,7 +1486,7 @@ EOT
         else
             failure "Failed to updated the docker proxy settings"
             umount /mnt
-            exit 1
+            return 1
         fi
         umount /mnt
     fi
@@ -674,47 +1529,36 @@ boot_order_change_to_disk() {
 }
 
 # Create OS Partitions
+# For now we are going with a default partition layout for OS disk with rootfs and boot partition, but this can be enhanced in future.
 create_os-partition() {
     echo -e "${BLUE}Creating the OS Partitions on disk $os_disk!!${NC}"
-    os_partition_script=/etc/scripts/os-partition.sh
+    #os_partition_script=/etc/scripts/os-partition.sh
 
-    if bash $os_partition_script "$lvm_size";  then
-        success "OS Partitions successful on $os_disk"
-    else
-        failure "OS Partitions failed on $os_disk,Please check!!"
-        return 1
-    fi
+    #if bash $os_partition_script "$lvm_size";  then
+    #    success "OS Partitions successful on $os_disk"
+    #else
+    #    failure "OS Partitions failed on $os_disk,Please check!!"
+    #    return 1
+    #fi
     return 0
 
 }
-custom_ntp_server_configuration() {
-    
-    echo -e "${BLUE}Custom NTP Server Configuration!!${NC}"
-    # Check if Custom NTP Server configuration provided as input
-    # ignore if not provide
-    CONFIG_FILE="/etc/scripts/config-file"
 
-    ntp_server=$(grep '^USER_CUSTOM_NTP_SERVERS=' "$CONFIG_FILE" \
-    | cut -d '=' -f2- \
-    | sed 's/^"//;s/"$//')
+# Ask for confirmation to reboot the system after provisioning is done in Attended MODE 
+ask_confirmation_for_reboot() {
+    TTY=/dev/tty1
+    dialog --title "Reboot Confirmation" \
+        --yesno "Provisioning completed successfully! Do you want to reboot now?" \
+        0 0 </dev/tty1 >/dev/tty1 2>/dev/null
 
-    ntp_yaml=$(printf '%s\n' "$ntp_server" \
-    | tr ',' '\n' \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-    | sed '/^$/d' \
-    | sed 's/^/    - /')
-
-    if [ -n "$ntp_server" ]; then
-	check_mnt_mount_exist
-        mount "${os_disk}${os_rootfs_part}" /mnt
-	sed -i "/^[[:space:]]*-[[:space:]]*time\.google\.com[[:space:]]*$/{
-        s|.*||
-        r /dev/stdin
-        d
-    }" /mnt/etc/cloud/cloud.cfg.d/installer.cfg <<EOF
-$ntp_yaml
-EOF
-     umount /mnt
+    if [ $? -eq 0 ]; then
+        echo "Rebooting system..."
+        return 0
+    else
+        echo "Please remember to reboot the system as soon as possible to complete the provisioning process."
+        clear >/dev/tty1
+        drop_to_shell
+        
      fi 
 }
 
@@ -723,23 +1567,32 @@ system_readiness_check() {
 
     get_usb_details || return 1
 
-    get_block_device_details || return 1
+    if [[ "$ATTENDEDMODE" == "true" ]]; then
+        print_block_device_details || return 1
+    else
+        get_block_device_details || return 1
+    fi
 }
 
 # Configure the system with username/proxy/cloud-init files
 platform_config_manager() {
 
+    if [[ "$ATTENDEDMODE" == "true" ]]; then
+        
+        create_user_account || return 1
+    fi
+
     setup_proxy_settings || return 1
+
+    if [[ "$proxy_settings" == "false"  ]] && [[ "$ATTENDEDMODE" == "true" ]]; then
+        ask_for_proxy_settings || return 1
+    fi
 
     copy_scripts_to_target || return 1
 
     install_cloud_init_file || return 1
 
     update_ssh_settings || return 1
-
-
-    #custom_ntp_server_configuration || return 1
-
 }
 
 # Post installation tasks
@@ -748,6 +1601,12 @@ system_finalizer() {
     boot_order_change_to_disk || return 1
 
     dump_logs_to_usb || return 1
+
+    if [[ "$ATTENDEDMODE" == "true" ]]; then
+       
+        ask_confirmation_for_reboot || return 1
+    fi
+   
 }
 
 # Progress Bar Function
@@ -769,6 +1628,10 @@ show_progress_bar() {
     printf "%b" "$progress_line" | tee /dev/tty1
 }
 drop_to_shell() {
+
+    dump_logs_to_usb || return 1
+
+    echo "Dropping to an interactive shell on tty1..."
     # Give a proper interactive shell
     setsid /sbin/agetty --autologin root --noclear 0 tty1 linux
     # If agetty not available fallback
@@ -814,11 +1677,19 @@ main() {
 
     # Step 4: Enable OS-Partitions on the platform 
     PROVISION_STEP=4
-    #show_progress_bar "$PROVISION_STEP" "Enable OS-Partitions on Platform"
-    #if ! create_os-partition  >> "$LOG_FILE" 2>&1; then
-    #    echo -e "${RED}\nERROR:OS-Partitions Creation Failed on platform,please check $LOG_FILE for more details,Aborting.${NC}"| tee /dev/tty1
-     #  drop_to_shell 
-    #fi
+    show_progress_bar "$PROVISION_STEP" "Enable OS-Partitions on Platform"
+    if [[ "$ATTENDEDMODE" == "true" ]]; then
+
+       if ! create_partitions  >> "$LOG_FILE" 2>&1; then
+             echo -e "${RED}\nERROR:OS-Partitions Creation Failed on platform,please check $LOG_FILE for more details,Aborting.${NC}"| tee /dev/tty1
+           drop_to_shell
+       fi
+    else 
+        if ! create_os-partition  >> "$LOG_FILE" 2>&1; then
+            echo -e "${RED}\nERROR:OS-Partitions Creation Failed on platform,please check $LOG_FILE for more details,Aborting.${NC}"| tee /dev/tty1
+           drop_to_shell 
+        fi
+    fi
 
     # Step 5: Post install Setup and reboot 
     PROVISION_STEP=5
