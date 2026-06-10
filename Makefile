@@ -1,5 +1,11 @@
-# SPDX-FileCopyrightText: (C) 2024 Intel Corporation
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
 # SPDX-License-Identifier: LicenseRef-Intel
+
+.PHONY: all build lint shellcheck clean coverage license list help
+SHELL := bash -eu -o pipefail
+
+# Find all shell scripts
+SH_FILES := $(shell find . -type f -name '*.sh')
 
 all: 
 	@# Help: Runs build, lint, test stages
@@ -13,20 +19,25 @@ build:
 	cd infrastructure/build-artifacts && sudo -E ./build-installation-artifacts.sh "$(MODE)" "$(ISO_URL)" "$(ICT_IMG)" && cd ../..
 	@echo "---END MAKEFILE Build---"
 
-lint:
+lint: shellcheck
 	@# Help: Runs lint stage
 	@echo "---MAKEFILE LINT---"
 	echo $@
 	@echo "---END MAKEFILE LINT---"
+# https://github.com/koalaman/shellcheck
+shellcheck:
+	@# Help: Lint shell scripts with shellcheck
+	shellcheck --version
+	shellcheck -x -S style $(SH_FILES)
 
 clean:
-	@# Help: Runs test stage
+	@# Help: Runs clean stage
 	@echo "---MAKEFILE CLEAN---"
 	echo $@
 	cd infrastructure/build-artifacts && sudo rm -rf out/ && cd ../..
 	cd infrastructure/host-os && sudo umount iso_mount  && sudo rm -rf iso_mount ubuntu-desktop-24.04* && cd ../..
 	cd infrastructure/micro-os && sudo rm -rf out/ && cd ../..
-	@echo "---END MAKEFILE TEST---"
+	@echo "---END MAKEFILE CLEAN---"
 	
 coverage:
 	@# Help: Runs coverage stage
