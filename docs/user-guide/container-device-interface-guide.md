@@ -21,7 +21,6 @@ CDI uses predefined YAML specification files in `/etc/cdi/` to describe the devi
 ## Prerequisites
 
 - Edge Node Infrastructure Blueprint image deployed
-- Ubuntu OS version 24.04 with kernel version 6.17 - recommended best-known configuration (BKC)
 - Docker Engine version 25 or newer (with CDI support enabled), Podman version 4.1 or newer, or containerd version 1.7 or newer
 - Intel GPU with SR-IOV VFs enabled
 - Intel NPU hardware present (optional)
