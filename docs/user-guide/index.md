@@ -26,7 +26,7 @@ This blueprint helps you:
 - Validate platform readiness for cloud-native edge workloads.
 
 The solution bridges the gap between edge hardware capabilities and application requirements,
-providing a standardized platform for deploying latency-sensitive workloads, AI and machine learning inference inference, 
+providing a standardized platform for deploying latency-sensitive workloads, AI and machine learning inference, 
 IoT processing, and real-time applications at the network edge.
 
 <!--hide_directive
